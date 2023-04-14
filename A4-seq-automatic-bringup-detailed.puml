@@ -1,0 +1,363 @@
+@startuml
+
+scale 4000 height
+
+title **<font color=brown>FTTH-8682: Design automatic Leaf/OLT/Spine bringup (for Release Goal GreenTea 020) </font>** (version 5/2020-05-11)
+header: File: A4-seq-automatic-bringup-detailed.puml <color blue><&arrow-right> [[https://gitlab.devops.telekom.de/Access40/dev/misc/information-model/-/tree/master/detail-seq/osr-sequence/ A4-seq-automatic-bringup-detailed.puml]]
+
+skinparam sequence {
+  ArrowColor DeepSkyBlue
+  ActorBorderColor DeepSkyBlue
+  LifeLineBorderColor blue
+  LifeLineBackgroundColor #A9DCDF
+  ParticipantBorderColor DeepSkyBlue
+  ParticipantBackgroundColor DodgerBlue
+  ParticipantFontName Impact
+  ParticipantFontSize 17
+  ParticipantFontColor #A9DCDF
+  ActorBackgroundColor aqua
+  ActorFontColor DeepSkyBlue
+  ActorFontSize 17
+  ActorFontName Aapex
+}
+autonumber
+
+actor "A4 OPS" as ops
+actor Technician
+
+box "NEMO & OSS-IT"
+  participant "DigiOSS" as OSS
+  participant "A4-NEMO-(EMS)API-GW" as A4EmsAPI 
+  participant "NEMO-OSSIT-A" as OSSAdapter
+end box
+
+box "A4-EMS" #CornSilk
+  participant "[A4-EMS-Actors]\nEMS-ShippingActor" as EmsShippingActor
+  participant "[A4-EMS-CD]\nEMS-CD-API" as EmsAPI
+  participant "[A4-EMS-CD]\nEMS-CD-Store" as EmsCD
+  participant "A4-EMS-MPMB" as EmsMB     
+  participant "[A4-EMS-Actors]\nPOD-ShippingActor" as EmsPodShippingActor
+end box
+
+box "A4-POD" #AliceBlue
+  participant "A4-POD-API-GW" as podapigw
+  participant "[A4-POD-CD]\nPOD-CD-API" as PodAPI
+  participant "[A4-POD-MPMB]\nPOD-MB" as PodMB
+  participant "[A4-POD-CD]\nPOD-CD-Store" as PodCD
+  participant "[A4-Pod-Actors]\nPod-Installation-Progress-Actor" as PodInstActor
+  participant "[A4-POD-Actors]\nPOD-Shipping-Actor" as PodShippingActor
+  participant "[A4-SWITCH-C]\nSWITCH-C" as SwitchC
+  participant "[A4-OLT-C]\nVOLTHA et. al." as OltC
+  participant "[A4-POD-DHCP]\nDHCP Server" as DHCPServer          
+  participant "Leaf-/Spine-Switch/OLT" as hwBox
+end box
+
+  note over Technician, ops: Prerequisite: The initial planning data (NEG, NE, NEP, NEL, "Strukturplanung") was already previously submitted to the A4-EMS and from there to A4-POD // M-SEQ-001 
+
+== Preliminary input all required operational data ==
+note right ops
+	To input in *OperationalData:
+	* leaf/spine: DHCP option 114 is computed from:
+		[NEG.binaryRepositoryUrl]/[NE.bootImageFilename]
+	* Leaf/Spine/OLT: Management-IP address\n& hostname
+		Currently obtained from [NE.ipv4Address]
+	* Leaf: all leaf-specific data in LeafNeOperationalData
+	* Spine: all spine-specific data in SpineNeOperationalData
+	* (OLT: currently no OLT-specific .OperationalData)
+	* also the images from Leaf/Spine (value of Option 114) have to be loaded to into POD-CD
+		[NEG.operationalData.binaryRepositoryUrl]/[NE.operationalData.bootImageFilename]
+End note
+
+ops -> A4EmsAPI: POST manual input of all required NE.OperationalData\n[NEG.operationalData.publicLoadBalancerIp],[NEG.operationalData.binaryRepositoryUrl],\n[NE.operationalData.bootImageFilename]
+A4EmsAPI -> EmsAPI: Forward *OperationalData\nto planning API of EMS-CD
+EmsAPI -> EmsCD: Store data
+EmsAPI -> EmsMB: Publish BusinessEvent\n"InventoryChanged"
+EmsMB -> EmsPodShippingActor: Consumes the business\nevent change notification
+ALT POD reachable
+	EmsPodShippingActor -> podapigw: Submits the new logical resource version
+	podapigw -> PodAPI: Forward *OperationalData to planning API of POD
+	PodAPI -> PodCD: Stores the new version of the logical resource
+	PodAPI -> PodMB: Produces a new business event "ObjectChanged"\n(further processing/e.g. POD Actor/omittted here)
+Else POD not reachable
+	note over PodAPI: The submission will happen when the pod is reachable again (recovery mechanism).
+End
+
+== Technician to prepare start of installation ==
+Technician -> OSS: select NE in Mobile UI,\nscan ztpIdent (serialNo or MacAddr)
+OSS -> OSS: Update NE\n(i.e. the planned Leaf/Spine/OLT)\nNE.lifecycleState = "INSTALLING"
+OSS -> A4EmsAPI: Sync NE to NEMO <b>(PUT)
+A4EmsAPI ->  OSSAdapter: Forward
+OSSAdapter -> EmsCD: Stores the updated logical resource version
+EmsAPI -> EmsMB: Publish BusinessEvent\n"InventoryChanged"
+EmsMB -> EmsPodShippingActor: Consumes the business\nevent "InventoryChanged" notification
+ALT POD reachable
+	EmsPodShippingActor -> podapigw: Submits the new logical resource version
+	podapigw -> PodAPI: Forward NE to planning API of POD
+	PodAPI -> PodCD: Stores the new version of the logical resource
+	PodAPI -> PodMB: Produces a new business event "ObjectChanged"
+	Alt NE.class == LEAF|SPINE
+		PodMB -> SwitchC: Consumes the resource change business event
+		SwitchC -> PodAPI: Fetch the resources associated to the changed NE\n(the NE and the NE' *OperationalData)
+		SwitchC -> SwitchC: Generates LEAF|SPINE base configuration
+		SwitchC -> PodAPI: Sends the base configuration file for the network element\nPOST http://pod-configurations/api/podConfigurationManagement/v1/configFile/:ztpIdent
+		PodAPI -> PodCD: Write file to POD-CD
+	End
+Else POD not reachable
+	note over PodAPI: <<will be described later>>
+End
+
+
+== POD is now prepared ==
+Technician -> hwBox: Cabling & turn on the Leaf/Spine/OLT
+hwBox -> DHCPServer: **[Hook-1]**\nBroadcast DHCP DISCOVER\n(with serial number in Option 61) 
+DHCPServer -> DHCPServer: Retrieve Option 61 value as "receivedZtpIdent"\nIf not present: Set MAC-value as "receivedZtpIdent"
+DHCPServer -> PodAPI: Query POD-CD for NEs with\n.ztpIdent==receivedZtpIdent
+PodAPI -> DHCPServer: Returns (1..n) logical resources incl.\n*OperationalData
+Alt No resource found
+	note over DHCPServer
+		put BusinessEvent "DhcpDiscoverOfUnkownDevice" & send to EMS (see "[A]" below)
+		(.notificationData contains the "receivedZtpIdent")
+		<color:#red>Not implemented at the moment.</color>
+	End note
+Else more than one resource found
+	note over DHCPServer
+		put BusinessEvent "DhcpDuplicateZtpIdent" & send to EMS (see "[A]" below)
+		(.notificationData contains the "receivedZtpIdent"
+		and all UUID of the found duplicate NE)
+		<color:#red>Not implemented at the moment.</color>
+	End note
+Else (expected case) one resource found
+	DHCPServer -> DHCPServer: Builds a DHCP OFFER including (for each?)\nthe values of [*OperationalData::dhcpOptions]-List\nincluding a.o.\n+ Option 114/the location of the boot image file\n+ in 'yiaddr' the intended mgmt. IP address taken from the\nNeOperationalData::ipAddressList (type=MANAGEMENT)
+	DHCPServer -> hwBox: Broadcast the DHCP OFFER
+	hwBox -> DHCPServer: Leaf/OLT requests IP address with DHCP REQUEST
+	ALT NE.Class == OLT
+		DHCPServer -> PodCD: Write received DHCP Options: extract option 60 from DHCP REQUEST\nand write to OltNeOperationalData::dhcpOptions
+ 	End
+	DHCPServer -> hwBox: Confirmation with DHCP ACK
+	
+	Note over DHCPServer
+		In order for the assignment to work we need the following characteristics:
+		
+		* ipv4Address
+		* mac
+		* cidr
+		* route
+
+		In case any of them is missing the whole process will fail and will be hard to debug.
+	End note
+	Par Leaf/Spine/OLT assign IP from DHCP ACK
+		hwBox -> hwBox: OLT assigns itself the management IP Address on\nthe interface that did DHCP
+	Else Processing in POD "DHCP ACK"	
+		DHCPServer -> PodMB: Produces business event "IpAddressAssignmentFinished"\n(notificationData contains assigned IP and version)
+		PodMB -> PodInstActor: Consumes Business event "IpAddressAssignmentFinished"
+		ALT NE.Class == "LEAF|SPINE"
+			' here we only have "IpAddressAssignmentFinished" for LEAF/SPINE (IpAddress)
+			PodInstActor -> PodCD: read NE-Ressource
+			PodInstActor -> PodCD: remove all previously recorded configuration files applied for by the switch.
+
+			ALT NE.lifecyleState == INSTALLING AND NE.operationalState != INSTALLING
+				PodInstActor -> PodMB: Produces business event "InstallStarted"\n(no notificationData) 
+				Group [A] shipping notifications to EMS
+					PodMB -> PodShippingActor: Retrieve "InstallStarted"
+					PodShippingActor -> EmsAPI: Send notification to EMS
+					EmsAPI -> EmsMB: put notification on A4-EMS-MPMB
+				End
+				EmsMB -> EmsShippingActor: Consume Business\nEvent (InstallStarted)
+				EmsShippingActor -> OSSAdapter: Forward Notification
+				OSSAdapter -> OSS: PATCH\nNE.operationalState == Installing\non D-OSS Resource API
+				note over OSS: This will Update NE and sync\nthat back to NEMO/POD...\nUpdate of Technician on\nApp will show new status		
+			Else (just create "StartupStarted")
+					PodInstActor->PodMB:  Produces business event "StartupStarted" (no notificationData)
+					PodShippingActor -> A4EmsAPI: Send notification to EMS
+				EmsAPI -> EmsMB: put notification on A4-EMS-MPMB\n(for the time being nothing will happen in EMS based on this notification)
+			End
+		Else NE.Class==OLT
+			DHCPServer -> PodMB: Produces "OperationalDataChanged" notification with the vendorClassId as payload.
+			
+			Note over DHCPServer, PodMB
+				This notification is transferred to EMS using standard process.
+				A dedicated actor updates the logical resource operational data with the newly discovered vendorClassId.
+				This results in a new version of the resource being sent to the POD.
+				The next step in OltC is triggered after the vendorClassId is available in the pod.
+			End note
+
+			PodInstActor -> OltC: (call to PADM): "OLT activation call"\nwith UUID of NE (OLT)
+			OltC -> PodAPI: query POD-CD for OLT-Object(UUID) and its .*OperationalData
+			ALT .vendorId taken from .OltNeOperationaldata.dhcpOPtions(.tag=60) is unknown
+				Note over OltC
+					<color:#red>Not implemented yet. We need to design this given option60 is learnt.</color>
+				End note
+				OltC->PodMB: Produces business event "StartupFailed" (errorMessage "Invalid DHCP option 60/vendorID" + invalid Option60 value)
+			Else .vendorId taken from .OltNeOperationaldata.dhcpOPtions(.tag=60) is unsupported by OltC
+				Note over OltC
+					<color:#red>Not implemented yet. We need to design this given option60 is learnt.</color>
+				End note
+				OltC->PodMB: Produces business event "StartupFailed" (errorMessage "unsupported DHCP option 60/vendorID" + unsupported Option60 value)
+			Else .vendorId is supported
+				OltC -> hwBox: connect to .OltNeOperationaldata.ipAddressList(.type==MANAGEMENT)\nusing adaptor identified by\n.OltNeOperationaldata.dhcpOPtions(.tag=60)
+				Note over OltC
+					<color:#red>Not implemented yet. Option60 is extracted from NE.operationalData.vendorClassId.</color>
+				End note
+
+				Alt connect to OLT successful
+					OltC-> PodMB: Produces business event "StartupStarted" (no notificationData)
+				Else connection fails
+					OltC->PodMB: Produces business event "StartupFailed"\n(errorMessage "could not connect to OLT" + ip-address in .ipAddressList(.type==MANAGEMENT))
+				End
+			End
+
+		' here we have either a "StartupStarted" or "StartupFailed" 					
+			PAR process "startup"-notification (shipping to EMS)
+				PodMB -> PodInstActor: Consumes "StartupStarted" (or "StartupFailed")
+				PodShippingActor -> A4EmsAPI: //A// Send notifications to EMS
+				EmsAPI -> EmsMB: put notification on A4-EMS-MPMB\n(for the time being nothing will happen in EMS based on this notification)
+			Else check for "install"-notification
+				PodInstActor -> PodCD: read NE-Ressource
+				ALT NE.lifecyleState == INSTALLING AND NE.operationalState != INSTALLING
+					Alt notification is "StartupStarted"
+						PodInstActor -> PodMB: Produces business event "InstallStarted"\n(no notificationData) 
+					Else notification is "StartupFailed"
+						PodInstActor -> PodMB: Produces business event "InstallFailed"\n(notificationData contains copy of notiData of "StartupFailed") 
+					End
+					PodShippingActor -> A4EmsAPI: Send notification to EMS
+					EmsAPI -> EmsMB: put notification on A4-EMS-MPMB
+					EmsMB -> EmsShippingActor: Consume Business\nEvent (InstallStarted/Failed)
+					EmsShippingActor -> OSSAdapter: Forward Notification
+					OSSAdapter -> OSS: PATCH\nNE.operationalState == Installing\n(or "failed" if "InstallFailed")\non D-OSS Resource API
+					note over OSS: This will Update NE and sync\nthat back to NEMO/POD...\nUpdate of Technician on\nApp will show new status		
+				End
+			End
+		End	
+	end
+	' parallel processing DHCP/notifications on "IpAddressAssignmentFinished"
+End
+
+' now the startup-/install-messages (-failed if recognizable) are created/processed
+' now the actual startup is on its way (IP via DHCP on the MGMT-IF)
+
+ALT NE.CLASS == "LEAF|SPINE"
+	alt Leaf in ONIE Boot mode (i.e. fist time boot)
+		hwBox -> PodCD: Fetches the operating system (value of received DHCP Option 114)
+		hwBox -> hwBox: Activates the image and reboots\n(continue back at '**[Hook-1]**' above)
+	Else (Leaf boots into image)	
+		note right hwBox
+			* steps for loading the OS/until DHCP INFORM/ omitted here
+			* here the POD already has sent a "StartupStarted" for the Leaf/Spine
+			* this stage is reentrant and also works for subsequent restarts of the switch.
+				* it was an explicit requirement to reapply the configuration files every time we restart the device.
+				* this mustn't be considered an update of the switch config procedure.
+					An automatic process without downtime must be documented.
+		End note 
+		hwBox -> DHCPServer: DHCP INFORM to get Option 210/Path Prefix
+		DHCPServer -> PodCD: compute Option 210 value ("http://[NEG.internalManagementLoadBalancerIp]/api/podConfigurationManagement/v1/configFile/[NE.ztpIdent]")
+		Note right DHCPServer: Error handling here: not done yet 
+		DHCPServer -> hwBox: DHCP ACK with Option 210 value\n(root path for config files)
+		hwBox -> hwBox: process/extract DHCP Option 210
+		hwBox -> PodCD: Fetches the base configuration files.
+		hwBox -> hwBox: Apply config files
+		hwBox -> SwitchC: sends greylog message indicating "load of configs successful" or "failed"\nto traget in Switch-C/M (managementplane-part of Switch-C)\n(the path for this is part of the controlD-coinfig above))
+		Alt checking greylog event: ConfigLoad NOT successful
+			SwitchC -> PodMB: Switch-C/M produces business event "StartupFailed"\n(errorMessage "ConfigLoad failed" + details (if available from greylog message))
+			note right SwitchC
+				processing the event to EMS and (in case of "installation"/InstallFailed) sending
+				this to OSSIT /patch on NE/ omitted here...follows [A] as being generic
+			End note
+		Else checking greylog event: ConfigLoad successful
+			SwitchC -> PodMB: Switch-C/M produces business event "NeStartupConfigLoaded"\n(with serial of NE)
+			SwitchC -> SwitchC: Switch-C/C builds "runningConfig" for Leaf|Spine\n(includes PAO interaction/not shown here)
+			SwitchC -> hwBox: Apply "runningConfig" to Leaf|Spine
+			note right SwitchC
+				Spine config will have (interim) all uplinks to
+				Backbone being 'admin down' (Ops later wil check
+				& manually set 'admin up')
+			end note
+			Alt runningConfig applied OK
+				SwitchC -> PodMB: Produces business event\nNeConfigApplied" (no notificationData)
+				' now we need to change local users' passwords
+				Note over SwitchC
+					<color:#red>Password change process is not implemented yet.</color>
+				End note
+
+				SwitchC -> PodAPI: read NE.OPerationalData:osCredentials
+				SwitchC -> hwBox: login SSH to Leaf|Spine
+				SwitchC -> SwitchC: generate new osCredentials.password 
+				SwitchC -> hwBox: se new Leaf|Spine local user admin password
+				SwitchC -> podapigw: write new PW to .*OperationalData::osCredentials.password
+				note right SwitchC
+					how to handle failure here (new pw set, but writing to POD-CD interrupted) will be sorted out later
+					also case that logging in via SSH oder setting the pw fails will
+					be added later.
+				end note
+				SwitchC -> PodMB: Produces business event "StartupFinished"\n(no notificationData)
+				' all done => install (if install/first time) finished
+			Else runningConfig applied FAILED
+				SwitchC -> PodMB: Produces business event\n"StartupFailed"\n(reason for failure in notificationData)
+			End
+		End
+	End
+ELSE  NE.Class == OLT
+	OltC -> OltC: configure Onos (preparations subscriber activation)/ preprovisioning => VOLTHA configures device in ONOS 
+	Alt registration in vOLTHA/Onos successful
+		OltC -> OltC: vOLTHA sends confirmation to PADM
+		OltC -> PodMB: PADM produces business event "StartupFinished"\n(no notificationData)
+	Else registration in vOLTHA <color:#red>NOT</color> successful
+		OltC -> OltC: vOLTHA sends error to PADM
+		OltC -> PodMB: PADM produces business event "StartupFailed"\n(notificationData contains string with reason)
+	End
+End
+
+note right PodInstActor
+	PoD Installation Actor here finds in A4-POD-MPMB
+	either a "StartupStarted" or "StartupFailed"-notification
+End Note
+PodMB -> PodInstActor: Consumes Business event
+PodInstActor -> PodAPI: reads resource from POD-CD
+
+Alt  Ne.lifecyleState == INSTALLING and NE.operationalState == "installing"
+	Alt triggering notification was "StartupFinished"
+		PodInstActor -> PodMB: Produces business event\n"InstallFinished" (notificationData: empty)
+	Else triggering notification was "StartupFailed"
+		PodInstActor -> PodMB: Produces business event\n"InstallFailed" (notificationData: copy of notiicationData of "StartupFailed")
+	End
+End
+
+' now Pod local processing of Events ("Startup*"" always and additionally "Install*" only if installation)
+PodShippingActor -> A4EmsAPI: Send notification(s) to EMS\n(may be two/independant)
+EmsAPI -> EmsMB: put notification on A4-EMS-MPMB
+EmsMB -> EmsShippingActor: Consume Business\nEvent (Startup/Install Started/Failed)
+EmsShippingActor -> OSSAdapter: Forward Notification
+Alt notificationType == "InstallStarted"|"StartupStarted"
+		OSSAdapter -> OSS: PATCH\nNE.operationalState == "WORKING"
+Else notificationType == "InstallFailed"|"StartupFailed"
+		OSSAdapter -> OSS: PATCH\nNE.operationalState == "FAILED"
+End
+note over OSS
+	This will update the NE in D-OSS.
+	In case "NE.LifecycleState" == "INSTALLING",
+	D-OSS will change this to "OPERATIONAL"
+	The NE will then be synced back  to NEMO/POD
+	in case of an installation: technician will see on "App" that
+	* .lifecycleState changed ("OPERATIONAL")
+	* and .operationalState change ("WORKING" or "FAILED")
+End note
+
+== in the meanwhile .. the technician waits ==
+Technician -> OSS: Watch .operationalState and .lifecycleState\non Mobile UI
+
+Technician -> Technician: "Finish installation if\n.operationalState is 'WORKING'\nor open incident to OPS if 'failed'"
+Alt NE.Class==SPINE only
+	Note left ops
+			<color:#red>"Somehow" ops is informed about a Spine being booted
+			and started/installed successfully to then check the 
+			Spines' state & undo "admin down" for the BB links.
+	End note
+	ops -> hwBox: do SSH into SPINE
+	ops -> hwBox: check config for BB connectivity
+	alt checks not okay?
+		ops -> hwBox: (SSH) manually correct wrong config or\nreboot Spine (reboot = back to **[Hook-1]**)
+	end
+	' config (now) okay
+	ops -> hwBox: undo "admin down" on BB links
+	ops -> hwBox: logoff SSH
+End
+@enduml
